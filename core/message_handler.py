@@ -31,6 +31,11 @@ def _should_respond(message: discord.Message, bot: discord.Client) -> bool:
     if message.author.id == bot.user.id or message.author.bot:
         return False
 
+    # 0) DM (กล่องข้อความส่วนตัว) = ตอบเสมอ ไม่ขึ้นกับการล็อกห้องหรือโหมด
+    #    ไม่งั้นตอนที่ล็อกห้องด้วย /jump จะคุยกับไอริทาง DM ไม่ได้เลย
+    if message.guild is None:
+        return True
+
     # 1) Mention / Reply ถึงบอท = ตอบเสมอ
     mentioned = bot.user.mentioned_in(message)
     is_reply_to_bot = (

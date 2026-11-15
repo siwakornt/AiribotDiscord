@@ -288,6 +288,35 @@ def test_spawn_keeps_task_reference_until_done():
     asyncio.run(main())
 
 
+def test_proactive_spreads_across_the_whole_day():
+    # เพดาน 4 ครั้ง/วัน ต้องกระจายทั้งวัน ไม่ใช่ใช้หมดตั้งแต่เช้า
+    # แล้วเงียบทั้งบ่าย-ค่ำ (ค่า chance เดิม 2%/นาทีทำแบบนั้น)
+    # ใช้ seed ตายตัว → ผลเทสต์คงที่ ไม่กระโดด
+    random.seed(42)
+    state = parse_state(None)
+    sent_hours: list[float] = []
+    day = _dt(0, 0, day=16)
+
+    for minute in range(24 * 60):
+        now = day + timedelta(minutes=minute)
+        last_ts, count = counters_for(state, now)
+        ok, _ = can_proactive(
+            now,
+            last_proactive_ts=last_ts,
+            count_today=count,
+            other_activity_ts=int(now.timestamp()) - 30,  # คนคุยในช่องอื่นตลอด
+            own_channel_ts=None,
+        )
+        if ok:
+            sent_hours.append(now.hour + now.minute / 60)
+            state = record_proactive(state, now)
+
+    assert len(sent_hours) == DAILY_CAP, f"ได้ {len(sent_hours)} ครั้ง ไม่ใช่ {DAILY_CAP}"
+    span = sent_hours[-1] - sent_hours[0]
+    assert span >= 6, f"ทักหมดใน {span:.1f} ชม.แรก — ไม่ได้กระจายทั้งวัน {sent_hours}"
+    assert sent_hours[-1] >= 15, f"ทักครั้งสุดท้ายก่อน 15:00 น. {sent_hours}"
+
+
 if __name__ == "__main__":
     test_is_quiet_hour_blocks_sleep_time()
     test_is_quiet_hour_allows_waking_time()
@@ -316,4 +345,5 @@ if __name__ == "__main__":
     test_maybe_followup_skips_when_chance_zero()
     test_maybe_followup_skips_when_no_text()
     test_spawn_keeps_task_reference_until_done()
+    test_proactive_spreads_across_the_whole_day()
     print("✅ test_proactive: all passed")
