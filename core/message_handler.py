@@ -252,6 +252,11 @@ async def handle_message(message: discord.Message, bot: discord.Client):
         # ส่งคำตอบ (แยกข้อความยาวอัตโนมัติ)
         await send_long(message.channel, reply, reference=message)
 
+        # 15% ที่ไอริจะคุยต่อเองภายใน 1 นาทีหลังตอบเสร็จ
+        # (error/log ทั้งหมดอยู่ใน proactive.send_followup — ห้ามทำให้การตอบล้ม)
+        from services import proactive
+        proactive.spawn(proactive.send_followup(message.channel, reply))
+
     except Exception as e:
         # error ที่แท้จริง — log เต็มๆ ไว้ debug ใน data/logs/airi.log
         logger.error("Error handling message: %s: %s", type(e).__name__, e, exc_info=True)

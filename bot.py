@@ -213,6 +213,16 @@ class AiriBot(commands.Bot):
 
     async def close(self) -> None:
         """ยกเลิก keep-alive task + ปิด health server ตอนบอทปิด"""
+        # ยกเลิกงานสุ่มชวนคุยที่ค้างอยู่ (proactive_task ถูกสร้างหลังคลาสนี้ → แก้ตอนเรียกใช้)
+        try:
+            proactive_task.cancel()
+        except Exception:
+            pass
+        try:
+            from services import proactive as _pro
+            _pro.cancel_all()
+        except Exception:
+            pass
         try:
             await _stop_health_server()
         except Exception as e:
@@ -251,7 +261,7 @@ async def announcement_task():
         return
 
     from services.ai_service import ai_service
-    from core.brain import PERSONA
+    from core.brain import PERSONA, _strip_directives
 
     try:
         # 07:00 อรุณสวัสดิ์ + อากาศ
@@ -267,14 +277,14 @@ async def announcement_task():
                 pass
             prompt = f"ตอนนี้เวลา {now.strftime('%H:%M')} ยามเช้า สภาพอากาศ: {weather or 'ไม่ทราบ'} เขียนข้อความอรุณสวัสดิ์พี่ๆ แบบสดใส น่ารักสไตล์ไอริ"
             text = await ai_service.generate(PERSONA, prompt, temperature=0.9)
-            await channel.send(text or f"อรุณสวัสดิ์ค่า~ ☀️ {weather}")
+            await channel.send(_strip_directives(text) or f"อรุณสวัสดิ์ค่า~ ☀️ {weather}")
 
         # 22:00 ฝันดี
         elif now.hour == 22 and now.minute == 0:
             _announced.add(minute_key)
             prompt = "ตอนนี้ 4 ทุ่มแล้ว เขียนข้อความบอกฝันดีพี่ๆ แบบน่ารักๆ สไตล์ไอริ"
             text = await ai_service.generate(PERSONA, prompt, temperature=0.9)
-            await channel.send(text or "ดึกแล้วน้า~ ฝันดีค่า 💤✨")
+            await channel.send(_strip_directives(text) or "ดึกแล้วน้า~ ฝันดีค่า 💤✨")
 
         # 23:00 ไล่นอน (เพิ่มงอน +1)
         elif now.hour == 23 and now.minute == 0:
@@ -328,7 +338,7 @@ async def _sleep_nudge(channel, grudge_add: int, gentle: bool):
 
     mentions = " ".join(t.mention for t in targets)
     from services.ai_service import ai_service
-    from core.brain import PERSONA
+    from core.brain import PERSONA, _strip_directives
     now_str = config.now().strftime("%H:%M")
     style = "ดุเบาๆ ด้วยความห่วงใย" if gentle else "เป็นห่วงเป็นใยมากๆ"
     prompt = f"ตอนนี้ {now_str} แล้ว เขียนข้อความไล่คนไม่ยอมนอน {mentions} แบบ{style} สไตล์ไอริ (ห้ามพูดเรื่องงอน)"
@@ -336,8 +346,111 @@ async def _sleep_nudge(channel, grudge_add: int, gentle: bool):
         text = await ai_service.generate(PERSONA, prompt, temperature=0.9)
     except Exception:
         text = None
+    # ตัด指令/ค่าสถานะ ออก — ผู้ใช้ต้องไม่เห็น
+    text = _strip_directives(text) if text else text
     fallback = f"⏰ {now_str} แล้วนะ! ไปนอนได้แล้วค่า~ 🛌💤" if not gentle else f"⏰ {now_str} ดึกมากแล้ว! ยังไม่นอนอีกเหรอคะ~ 💤"
     await channel.send(f"{mentions}\n{text or fallback}")
+
+
+# ==========================================
+# ระบบสุ่มชวนคุย (ไอริทักขึ้นมาเอง)
+# ==========================================
+# กิจกรรมของคนในเซิร์ฟเวอร์ — ไม่ต้อง persist: หายตอน restart ก็เริ่มใหม่
+_activity: dict[str, int | None] = {"other": None, "own": None}
+# (task tracking สำหรับข้อความเสริม อยู่ใน services/proactive.spawn)
+
+
+def _record_activity(message: discord.Message) -> None:
+    """จำเวลาที่คนล่าสุดคุย — ในช่องไอริ กับ ช่องอื่น เก็บแยกกัน"""
+    if message.author.bot or message.guild is None:
+        return
+    ts = int(config.now().timestamp())
+    own_id = config.latest_channel_id or config.ANNOUNCEMENT_CHANNEL_ID
+    if own_id and message.channel.id == own_id:
+        _activity["own"] = ts
+    else:
+        _activity["other"] = ts
+
+
+def _proactive_channel():
+    """ช่องที่ไอริใช้ทักขึ้นมาเอง (ห้องล็อกก่อน ไม่งั้นห้องประกาศ)"""
+    channel_id = config.latest_channel_id or config.ANNOUNCEMENT_CHANNEL_ID
+    if not channel_id:
+        return None
+    return bot.get_channel(channel_id)
+
+
+async def _proactive_text() -> str:
+    """แต่งข้อความที่ไอริทักขึ้นมาเอง (ตัด指令 ก่อนส่งเสมอ)"""
+    from services.ai_service import ai_service
+    from core.brain import PERSONA, _strip_directives
+
+    prompt = (
+        "มีคนคุยกันอยู่ในเซิร์ฟเวอร์หลายช่อง แต่ห้องนี้ไม่มีใครพูดอะไรเลย "
+        "ไอริคิดขึ้นมาเองแล้วพูดขึ้นมา 1-2 ประโยค เหมือนคนรอไม่ไหวอยากเล่าอะไร "
+        "สไตล์กวนๆ ขี้เล่น ตามบุคลิก "
+        "ไม่ต้องอ้างว่าห้องอื่นเงียบ ไม่ต้องพิมพ์คำสั่งอะไรทั้งสิ้น"
+    )
+    raw = await ai_service.generate(PERSONA, prompt, temperature=0.95)
+    return _strip_directives(raw or "")
+
+
+@tasks.loop(minutes=1)
+async def proactive_task():
+    """สุ่มไอริทักขึ้นมาเอง เมื่อมีคนคุยในช่องอื่น
+
+    กติกากันน่ารำคาญทั้งหมด (งดช่วงนอน/เว้นห่าง/เพดานรายวัน/โอกาสสุ่ม)
+    อยู่ใน services/proactive.py — มีเทสต์คุม 26 เคส
+    """
+    from services import proactive as pro
+    from memory import storage as st
+
+    channel = _proactive_channel()
+    if channel is None:
+        return
+
+    now = config.now()
+    try:
+        state = pro.parse_state(st.get_setting("proactive_state"))
+    except Exception as e:
+        logger.warning("proactive load state error: %s", e)
+        state = pro.parse_state(None)
+
+    last_ts, count = pro.counters_for(state, now)
+    ok, reason = pro.can_proactive(
+        now,
+        last_proactive_ts=last_ts,
+        count_today=count,
+        other_activity_ts=_activity["other"],
+        own_channel_ts=_activity["own"],
+    )
+    if not ok:
+        if reason in ("cooldown", "daily_cap"):
+            logger.debug("proactive skip: %s", reason)
+        return
+
+    try:
+        text = await _proactive_text()
+    except Exception as e:
+        logger.error("proactive generate error: %s", e, exc_info=True)
+        return
+    if not text:
+        return
+
+    try:
+        await channel.send(text)
+    except Exception as e:
+        logger.error("proactive send error: %s", e, exc_info=True)
+        return
+
+    # บันทึก state ก่อนเสมอ กันยิงซ้ำในนาทีถัดไป
+    try:
+        st.set_setting("proactive_state", pro.dump_state(pro.record_proactive(state, now)))
+    except Exception as e:
+        logger.warning("proactive save state error: %s", e)
+
+    logger.info("Proactive sent: %s", text[:60])
+    pro.spawn(pro.send_followup(channel, text))
 
 
 # ==========================================
@@ -401,6 +514,10 @@ async def on_ready():
         announcement_task.start()
         logger.info("Announcement task started")
 
+    if not proactive_task.is_running():
+        proactive_task.start()
+        logger.info("Proactive task started")
+
     # แสดงโหมดตอบ
     logger.info("Respond mode: %s | Model: %s", config.RESPOND_MODE, config.MODEL_NAME)
     logger.info("Locked channel: %s", config.latest_channel_id or "(not set - mention only)")
@@ -412,6 +529,9 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+    # จำเวลาที่คนคุย (ใช้เป็นเงื่อนไขระบบสุ่มชวนคุย)
+    _record_activity(message)
+
     # ตอบข้อความสนทนา (AI)
     await message_handler.handle_message(message, bot)
 

@@ -169,6 +169,26 @@ def _strip_directives(reply: str) -> str:
     return text.strip()
 
 
+async def get_followup(previous_text: str) -> str:
+    """แต่งข้อความเสริมที่ไอริพูดต่อเองหลังข้อความก่อนหน้า (ใช้ตอนสุ่มคุยต่อ 15%)
+
+    ตัด指令/ค่าสถานะออกเหมือนคำตอบปกติ — ผู้ใช้ห้ามเห็นส่วนนั้น
+    คืน "" ถ้าแต่งไม่ได้ → ผู้เรียกจะไม่ส่งอะไรออกไป
+    """
+    prompt = (
+        f"ไอริเพิ่งพูดออกไปว่า: {previous_text}\n"
+        "นึกอะไรขึ้นมาได้อีก เลยพูดเสริมอีก 1 ประโยค สไตล์เดียวกับที่เพิ่งพูด "
+        "ต่อเนื่องเป็นธรรมชาติเหมือนคนที่เพิ่งนึกอะไรออก "
+        "ไม่ต้องทักทายซ้ำ ไม่ต้องสรุป ไม่ต้องพิมพ์คำสั่งอะไรทั้งสิ้น"
+    )
+    try:
+        raw = await ai_service.generate(PERSONA, prompt, temperature=0.95)
+    except Exception as e:
+        logger.warning("followup generate error: %s", e)
+        return ""
+    return _strip_directives(raw or "")
+
+
 async def get_reply(
     guild_id: int,
     channel_id: int,
