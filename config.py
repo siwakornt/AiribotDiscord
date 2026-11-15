@@ -5,6 +5,7 @@
 # ==========================================
 
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -62,6 +63,32 @@ FALLBACK_MODELS = [
     for m in (os.getenv("MODEL_FALLBACK", "gemini-3.5-flash-lite,gemini-2.5-flash-lite") or "").split(",")
     if m.strip() and m.strip() != MODEL_NAME
 ]
+
+# --- Timezone ---
+# ค่าเริ่มต้น = เวลาไทย (UTC+7)
+# กันปัญหา server ที่รัน UTC (เช่น Render) ทำให้ไอริบอกเวลาผิด เช่น บอก 11 โมง ตอน 18:37
+# ตั้งผ่าน env ได้: TIMEZONE=Asia/Bangkok | Asia/Tokyo | Europe/London ...
+TIMEZONE = (os.getenv("TIMEZONE", "") or "Asia/Bangkok").strip()
+
+
+def _load_tz():
+    """โหลด tz database ถ้าหาไม่เจอ → fallback เป็น UTC+7 (เวลาไทย)"""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(TIMEZONE)
+    except Exception:
+        # ไม่มี tz database ในเครื่อง → ใช้ offset ไทยเป็นค่าสำรอง
+        return timezone(timedelta(hours=7))
+
+
+TZ = _load_tz()
+
+
+def now():
+    """เวลาปัจจุบันตาม TIMEZONE ที่ตั้งไว้ — ใช้แทน datetime.now() ทุกจุด
+    (datetime.now() จะคืนเวลา server/UTC ทำให้บอกเวลาผิดบน Render)"""
+    return datetime.now(TZ)
+
 
 # --- Respond Mode ---
 RESPOND_MODE = (os.getenv("RESPOND_MODE", "mention") or "mention").strip().lower()

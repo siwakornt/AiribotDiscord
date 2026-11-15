@@ -104,7 +104,7 @@ async def announcement_task():
         return
 
     from datetime import datetime
-    now = datetime.now()
+    now = config.now()
     minute_key = (now.strftime("%Y-%m-%d"), now.hour, now.minute)
     if minute_key in _announced:
         return
@@ -192,7 +192,7 @@ async def _sleep_nudge(channel, grudge_add: int, gentle: bool):
     mentions = " ".join(t.mention for t in targets)
     from services.ai_service import ai_service
     from core.brain import PERSONA
-    now_str = __import__("datetime").datetime.now().strftime("%H:%M")
+    now_str = config.now().strftime("%H:%M")
     style = "ดุเบาๆ ด้วยความห่วงใย" if gentle else "เป็นห่วงเป็นใยมากๆ"
     prompt = f"ตอนนี้ {now_str} แล้ว เขียนข้อความไล่คนไม่ยอมนอน {mentions} แบบ{style} สไตล์ไอริ (ห้ามพูดเรื่องงอน)"
     try:

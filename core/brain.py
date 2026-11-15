@@ -66,7 +66,7 @@ Emoji: ต้องใช้ Emoji (เช่น 😉, 😂, 🙄, 😏) เพ�
 
 def _time_hint() -> str:
     """ข้อความบอกเวลา เพื่อให้ไอริตอบสัมพันธ์กับเวลาตาม Persona"""
-    now = datetime.now()
+    now = config.now()
     h = now.hour
     if 23 <= h or h < 2:
         period = "ดึกมาก (เที่ยงคืน-ตีสอง) ไอริง่วงมาก ควรไล่เพื่อนไปนอน"
