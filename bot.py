@@ -4,13 +4,16 @@ bot.py - จุดเริ่มต้น Airi Discord Bot
 รันด้วย: python bot.py
 """
 
+import os
 import sys
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import aiohttp
 import discord
+from aiohttp import web
 from discord.ext import commands, tasks
 
 import config
@@ -71,16 +74,150 @@ EXTENSIONS = [
 ]
 
 
+# ==========================================
+# Health Server + Keep-alive (สำหรับ Render Web Service)
+# ==========================================
+# Render จะสแกนหาพอร์ตที่เปิดอยู่เพื่อเช็คว่า deploy ผ่านไหม
+# ถ้าไม่เปิดพอร์ตเลยจะขึ้น "No open ports detected" แล้ว deploy timeout
+# บอท Discord ไม่ต้องรับทราฟฟิกจริง จึงเปิด HTTP server เล็กๆ ไว้ตอบ /health เท่านั้น
+_health_started = False  # กัน start ซ้ำ (on_ready ถูกเรียกซ้ำได้ทุกครั้งที่ reconnect)
+_health_runner = None    # web.AppRunner ไว้ cleanup ตอนปิดบอท
+_keepalive_task = None   # background task ยิง ping ตัวเองทุก 10 นาที
+
+KEEPALIVE_INTERVAL = 600  # วินาที (10 นาที)
+KEEPALIVE_TIMEOUT = 10    # วินาที
+
+
+def _health_port() -> int:
+    """อ่านพอร์ตจาก env PORT (Render ตั้งให้เอง) default 10000"""
+    try:
+        return int((os.getenv("PORT", "") or "10000").strip())
+    except ValueError:
+        return 10000
+
+
+async def _health_ok(request: web.Request) -> web.Response:
+    """ตอบ OK status 200 ให้ Render health check"""
+    return web.Response(text="OK", status=200)
+
+
+async def _keepalive_loop(base_url: str) -> None:
+    """ยิง GET /health ไปที่ตัวเองทุก 10 นาที กัน Render แพลนฟรี spin down
+    ห้ามให้ task ตาย: จับ exception ไว้ใน loop แล้วทำงานต่อ"""
+    while True:
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+        try:
+            timeout = aiohttp.ClientTimeout(total=KEEPALIVE_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{base_url}/health") as resp:
+                    logger.info(
+                        "Keep-alive ping OK: %s/health (status=%s)", base_url, resp.status
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Keep-alive ping failed: %s/health - %s: %s", base_url, type(e).__name__, e
+            )
+
+
+def _start_keepalive() -> None:
+    """เริ่ม task keep-alive (ข้ามถ้าไม่ได้ตั้ง RENDER_EXTERNAL_URL)"""
+    global _keepalive_task
+    base_url = (os.getenv("RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
+    if not base_url:
+        logger.info("Keep-alive skipped (RENDER_EXTERNAL_URL not set)")
+        return
+    if _keepalive_task is not None and not _keepalive_task.done():
+        return
+    _keepalive_task = asyncio.create_task(_keepalive_loop(base_url))
+    logger.info(
+        "Keep-alive started: GET %s/health ทุก %s วินาที", base_url, KEEPALIVE_INTERVAL
+    )
+
+
+async def _start_health_server() -> None:
+    """เปิด HTTP server ที่ 0.0.0.0:PORT ตอบ / และ /health
+    รันใน event loop เดียวกับบอท — กัน start ซ้ำด้วย _health_started"""
+    global _health_started, _health_runner
+    if _health_started:
+        return
+    _health_started = True
+
+    port = _health_port()
+    app = web.Application()
+    app.router.add_get("/", _health_ok)
+    app.router.add_get("/health", _health_ok)
+
+    runner = web.AppRunner(app)
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+    except Exception as e:
+        # bind พอร์ตไม่ได้ -> log error แต่ห้ามให้บอทล้ม
+        logger.error(
+            "Health server failed to bind 0.0.0.0:%s - %s: %s",
+            port, type(e).__name__, e, exc_info=True,
+        )
+        try:
+            await runner.cleanup()
+        except Exception:
+            pass
+        return
+
+    _health_runner = runner
+    logger.info("Health server started on 0.0.0.0:%s (GET / , GET /health)", port)
+    _start_keepalive()
+
+
+async def _stop_health_server() -> None:
+    """ยกเลิก keep-alive task + ปิด health server อย่างถูกต้องตอนบอทปิด"""
+    global _keepalive_task, _health_runner
+
+    if _keepalive_task is not None:
+        _keepalive_task.cancel()
+        try:
+            await _keepalive_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("Keep-alive stop error: %s", e)
+        _keepalive_task = None
+        logger.info("Keep-alive stopped")
+
+    if _health_runner is not None:
+        try:
+            await _health_runner.cleanup()
+        except Exception as e:
+            logger.warning("Health server cleanup error: %s", e)
+        _health_runner = None
+        logger.info("Health server stopped")
+
+
 class AiriBot(commands.Bot):
     """Bot subclass เพื่อ override setup_hook (โหลด extensions ก่อน sync)"""
 
     async def setup_hook(self):
+        # เปิด health server ใน event loop เดียวกับบอท
+        # setup_hook ถูกเรียกครั้งเดียว + _health_started กันซ้ำ
+        # แม้ on_ready ถูกเรียกหลายครั้งตอน reconnect ก็จะไม่ start ซ้ำ
+        await _start_health_server()
+
         for ext in EXTENSIONS:
             try:
                 await self.load_extension(ext)
                 logger.info("Loaded extension: %s", ext)
             except Exception as e:
                 logger.error("Failed to load %s: %s", ext, e, exc_info=True)
+
+    async def close(self) -> None:
+        """ยกเลิก keep-alive task + ปิด health server ตอนบอทปิด"""
+        try:
+            await _stop_health_server()
+        except Exception as e:
+            logger.warning("Health shutdown error: %s", e)
+        await super().close()
 
 
 bot = AiriBot(
