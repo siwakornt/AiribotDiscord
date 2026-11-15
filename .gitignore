@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ห้าม commit ค่าลับเด็ดขาด
+.env
+*.env.local
+
+# SQLite sidecar + log (ไม่ใช่ข้อมูลที่ต้องใช้ตอน deploy)
+data/logs/
+*.db-shm
+*.db-wal
