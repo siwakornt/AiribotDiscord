@@ -1,0 +1,353 @@
+# -*- coding: utf-8 -*-
+"""
+bot.py - จุดเริ่มต้น Airi Discord Bot
+รันด้วย: python bot.py
+"""
+
+import sys
+import asyncio
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import discord
+from discord.ext import commands, tasks
+
+import config
+from memory import storage
+from core import message_handler
+from services.ai_service import ai_service, TOTAL_REQUEST_BUDGET
+
+# ==========================================
+# Logging (ไม่บันทึก Token/API Key ลง log)
+# ==========================================
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+def setup_logging():
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # console
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%H:%M:%S"))
+    root.addHandler(ch)
+
+    # file (หมุนเวียน 1MB x 3)
+    try:
+        log_file = config.LOG_DIR / "airi.log"
+        fh = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        fh.setFormatter(logging.Formatter(LOG_FORMAT))
+        root.addHandler(fh)
+    except Exception:
+        pass
+
+    # ปิด log จาก library ที่ noise เกินไป
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    logging.getLogger("google").setLevel(logging.WARNING)
+
+setup_logging()
+logger = logging.getLogger("airi.bot")
+
+# ==========================================
+# Bot Setup
+# ==========================================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+intents.messages = True
+intents.reactions = True
+
+# ==========================================
+# Extensions (คำสั่งทั้งหมด)
+# ==========================================
+EXTENSIONS = [
+    "commands.slash",
+    "commands.nickname",
+    "commands.memory",
+    "commands.admin",
+    "commands.economy",
+    "commands.games",
+]
+
+
+class AiriBot(commands.Bot):
+    """Bot subclass เพื่อ override setup_hook (โหลด extensions ก่อน sync)"""
+
+    async def setup_hook(self):
+        for ext in EXTENSIONS:
+            try:
+                await self.load_extension(ext)
+                logger.info("Loaded extension: %s", ext)
+            except Exception as e:
+                logger.error("Failed to load %s: %s", ext, e, exc_info=True)
+
+
+bot = AiriBot(
+    command_prefix=config.COMMAND_PREFIX,
+    intents=intents,
+    help_command=None,  # ใช้ /airihelp แทน
+)
+
+
+# ==========================================
+# Tasks: แจ้งเตือนเวลา + Auto save
+# ==========================================
+_announced = set()  # กันส่งซ้ำในนาทีเดียว
+
+
+@tasks.loop(minutes=1)
+async def announcement_task():
+    """แจ้งเตือนเวลา: อรุณสวัสดิ์ 07:00 / ฝันดี 22:00 / ไล่นอน 23:00, 23:30"""
+    channel_id = config.ANNOUNCEMENT_CHANNEL_ID
+    if not channel_id:
+        return
+
+    from datetime import datetime
+    now = datetime.now()
+    minute_key = (now.strftime("%Y-%m-%d"), now.hour, now.minute)
+    if minute_key in _announced:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        return
+
+    from services.ai_service import ai_service
+    from core.brain import PERSONA
+
+    try:
+        # 07:00 อรุณสวัสดิ์ + อากาศ
+        if now.hour == 7 and now.minute == 0:
+            _announced.add(minute_key)
+            weather = ""
+            try:
+                import requests
+                r = requests.get("https://wttr.in/Bangkok?format=3&lang=th", timeout=5)
+                if r.status_code == 200:
+                    weather = r.text.strip()
+            except Exception:
+                pass
+            prompt = f"ตอนนี้เวลา {now.strftime('%H:%M')} ยามเช้า สภาพอากาศ: {weather or 'ไม่ทราบ'} เขียนข้อความอรุณสวัสดิ์พี่ๆ แบบสดใส น่ารักสไตล์ไอริ"
+            text = await ai_service.generate(PERSONA, prompt, temperature=0.9)
+            await channel.send(text or f"อรุณสวัสดิ์ค่า~ ☀️ {weather}")
+
+        # 22:00 ฝันดี
+        elif now.hour == 22 and now.minute == 0:
+            _announced.add(minute_key)
+            prompt = "ตอนนี้ 4 ทุ่มแล้ว เขียนข้อความบอกฝันดีพี่ๆ แบบน่ารักๆ สไตล์ไอริ"
+            text = await ai_service.generate(PERSONA, prompt, temperature=0.9)
+            await channel.send(text or "ดึกแล้วน้า~ ฝันดีค่า 💤✨")
+
+        # 23:00 ไล่นอน (เพิ่มงอน +1)
+        elif now.hour == 23 and now.minute == 0:
+            _announced.add(minute_key)
+            await _sleep_nudge(channel, grudge_add=1, gentle=False)
+
+        # 23:30 ไล่นอน (เพิ่มงอน +2)
+        elif now.hour == 23 and now.minute == 30:
+            _announced.add(minute_key)
+            await _sleep_nudge(channel, grudge_add=2, gentle=True)
+
+    except Exception as e:
+        logger.error("announcement error: %s", e, exc_info=True)
+
+
+async def _sleep_nudge(channel, grudge_add: int, gentle: bool):
+    """สร้างข้อความไล่นอน + เพิ่มงอนให้สมาชิกออนไลน์"""
+    from memory import storage as st
+    targets = []
+    for member in channel.guild.members:
+        if member.bot or member.status == discord.Status.offline:
+            continue
+        # กรองตามยศถ้ากำหนดไว้
+        if config.SLEEP_ROLE_NAMES:
+            if not any(
+                any(role_name in (r.name or "").lower() for role_name in config.SLEEP_ROLE_NAMES)
+                for r in member.roles
+            ):
+                continue
+        targets.append(member)
+        # เพิ่มงอน
+        conn = st.get_conn()
+        row = conn.execute(
+            "SELECT grudge FROM user_stats WHERE user_id = ? AND guild_id = ?",
+            (member.id, channel.guild.id),
+        ).fetchone()
+        current = row["grudge"] if row else 0
+        new_grudge = min(4, current + grudge_add)
+        conn.execute(
+            """
+            INSERT INTO user_stats (user_id, guild_id, grudge)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, guild_id) DO UPDATE SET grudge = excluded.grudge
+            """,
+            (member.id, channel.guild.id, new_grudge),
+        )
+        conn.commit()
+
+    if not targets:
+        return
+
+    mentions = " ".join(t.mention for t in targets)
+    from services.ai_service import ai_service
+    from core.brain import PERSONA
+    now_str = __import__("datetime").datetime.now().strftime("%H:%M")
+    style = "ดุเบาๆ ด้วยความห่วงใย" if gentle else "เป็นห่วงเป็นใยมากๆ"
+    prompt = f"ตอนนี้ {now_str} แล้ว เขียนข้อความไล่คนไม่ยอมนอน {mentions} แบบ{style} สไตล์ไอริ (ห้ามพูดเรื่องงอน)"
+    try:
+        text = await ai_service.generate(PERSONA, prompt, temperature=0.9)
+    except Exception:
+        text = None
+    fallback = f"⏰ {now_str} แล้วนะ! ไปนอนได้แล้วค่า~ 🛌💤" if not gentle else f"⏰ {now_str} ดึกมากแล้ว! ยังไม่นอนอีกเหรอคะ~ 💤"
+    await channel.send(f"{mentions}\n{text or fallback}")
+
+
+# ==========================================
+# Events
+# ==========================================
+async def _ai_warmup():
+    """ยิงเรียก AI ครั้งเดียวตอนเปิดบอท เพื่อ warm DNS/TLS ของ Google
+    กันข้อความแรกของผู้ใช้ต้องรอค้างจน timeout (ตอบช้า ~60 วิ)
+    timeout ต้องมากกว่า TOTAL_REQUEST_BUDGET เพราะมี retry + fallback โมเดล"""
+    try:
+        await asyncio.wait_for(
+            ai_service.chat(
+                system_prompt="ping",
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.0,
+                max_tokens=8,
+            ),
+            timeout=TOTAL_REQUEST_BUDGET + 15,
+        )
+        logger.info("AI warmup OK (โมเดลที่ใช้: %s)", ai_service._model)
+    except Exception as e:
+        logger.info("AI warmup ข้ามไป (%s: %s)", type(e).__name__, e)
+
+
+@bot.event
+async def on_ready():
+    logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+
+    # Init database
+    try:
+        storage.init_db()
+        logger.info("Database initialized: %s", config.DB_PATH)
+    except Exception as e:
+        logger.error("DB init failed: %s", e)
+
+    # โหลดค่าห้องที่ล็อก (legacy latest_channel_id) + ห้องตั้งค่าต่างๆ จาก DB
+    try:
+        saved = storage.get_setting("latest_channel_id")
+        if saved is not None:
+            config.latest_channel_id = int(saved)
+            logger.info("Locked channel restored: %s", config.latest_channel_id)
+        saved_wel = storage.get_setting("welcome_channel_id")
+        if saved_wel:
+            config.WELCOME_CHANNEL_ID = int(saved_wel)
+        saved_ann = storage.get_setting("announcement_channel_id")
+        if saved_ann:
+            config.ANNOUNCEMENT_CHANNEL_ID = int(saved_ann)
+    except Exception as e:
+        logger.warning("Restore settings failed: %s", e)
+
+    # Sync slash commands (หลังโหลด extensions แล้ว)
+    try:
+        synced = await bot.tree.sync()
+        logger.info("Synced %d slash commands", len(synced))
+        for cmd in synced:
+            logger.info("  /%s - %s", cmd.name, cmd.description or "")
+    except Exception as e:
+        logger.warning("Slash sync failed: %s", e)
+
+    if not announcement_task.is_running():
+        announcement_task.start()
+        logger.info("Announcement task started")
+
+    # แสดงโหมดตอบ
+    logger.info("Respond mode: %s | Model: %s", config.RESPOND_MODE, config.MODEL_NAME)
+    logger.info("Locked channel: %s", config.latest_channel_id or "(not set - mention only)")
+    logger.info("✨ Airi is ready!")
+
+    # Warm-up AI แบบไม่บล็อก (แก้ข้อความแรกตอบช้า)
+    asyncio.create_task(_ai_warmup())
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # ตอบข้อความสนทนา (AI)
+    await message_handler.handle_message(message, bot)
+
+    # ประมวลผลคำสั่ง prefix ด้วย
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if not config.WELCOME_CHANNEL_ID:
+        return
+    channel = bot.get_channel(config.WELCOME_CHANNEL_ID)
+    if channel is None:
+        return
+    embed = discord.Embed(
+        title="✨ ยินดีต้อนรับสู่เซิร์ฟเวอร์ค่า! 🎉",
+        description=f"ยินดีต้อนรับ {member.mention} นะคะ~ ขอให้สนุกน้า! 💕",
+        color=0xFFB6C1,
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"สมาชิกลำดับที่ {member.guild.member_count}")
+    await channel.send(embed=embed)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("ไม่มีสิทธิ์ใช้คำสั่งนี้นะคะ 😤")
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("ข้อมูลที่ใส่ไม่ถูกต้องน้า~ ลองใหม่นะคะ")
+        return
+    logger.error("Command error: %s", error, exc_info=True)
+    try:
+        await ctx.send("มีข้อผิดพลาดบางอย่างน้า~ 😢 ลองใหม่อีกทีนะคะ")
+    except Exception:
+        pass
+
+
+# ==========================================
+# Main
+# ==========================================
+def main():
+    # ตรวจค่าที่จำเป็น
+    errors = config.validate()
+    if errors:
+        print("❌ ไม่สามารถเริ่มบอทได้:")
+        for e in errors:
+            print(f"   - {e}")
+        print("\nตั้งค่า DISCORD_TOKEN / GOOGLE_API_KEY ใน .bashrc (export ...) หรือ .env แล้วรันใหม่นะคะ")
+        sys.exit(1)
+
+    # สร้างโฟลเดอร์ data
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("🌸 เริ่มต้น Airi Discord Bot...")
+    print(f"   Mode: {config.RESPOND_MODE} | Model: {config.MODEL_NAME}")
+    print(f"   DB: {config.DB_PATH}")
+
+    try:
+        bot.run(config.DISCORD_TOKEN, log_handler=None)
+    except KeyboardInterrupt:
+        print("\nปิดบอทเรียบร้อยแล้วค่า 👋")
+    except discord.LoginFailure:
+        print("❌ DISCORD_TOKEN ไม่ถูกต้องนะคะ ตรวจสอบ .bashrc หรือ .env อีกทีค่ะ")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ เกิดข้อผิดพลาด: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
